@@ -1,0 +1,31 @@
+[package]
+name = "wfmash-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Erik Garrison <erik.garrison@gmail.com>", "Andrea Guarracino <aguarra1@uthsc.edu>"]
+license = "MIT"
+description = "Rust bindings for wfmash whole-genome aligner"
+repository = "https://github.com/pangenome/wfmash-rs"
+keywords = ["genomics", "alignment", "bioinformatics", "wfmash", "pangenomics"]
+categories = ["science", "api-bindings"]
+exclude = [
+    "target/",
+    "data/",
+    "deps/wfmash/data/",
+    "*.md",
+    "!README.md",
+    "!LICENSE",
+]
+
+[dependencies]
+thiserror = "1.0"
+anyhow = "1.0"
+tempfile = "3.8"
+num_cpus = "1.16"
+which = "6.0"
+
+[build-dependencies]
+# We use std::process::Command directly for CMake
+
+[dev-dependencies]
+pretty_assertions = "1.4"

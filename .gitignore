@@ -1,0 +1,7 @@
+/target
+*.paf
+*.fa
+*.fasta
+*.fa.gz
+*.fasta.gz
+!data/*.fa.gz
