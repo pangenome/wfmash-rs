@@ -317,7 +317,7 @@ if (BUILD_DEPS)
       ${CMAKE_CURRENT_BINARY_DIR}/gsl/lib/libgsl.a
       ${CMAKE_CURRENT_BINARY_DIR}/gsl/lib/libgslcblas.a
       ${CMAKE_CURRENT_BINARY_DIR}/htslib/lib/libhts.a
-      ${CMAKE_CURRENT_BINARY_DIR}/libdeflate/lib64/libdeflate.a
+      ${CMAKE_CURRENT_BINARY_DIR}/libdeflate/lib/libdeflate.a
       ${CMAKE_CURRENT_BINARY_DIR}/zlib/lib/libz.a
       ${CMAKE_CURRENT_BINARY_DIR}/bzip2/lib/libbz2.a
       ${CMAKE_CURRENT_BINARY_DIR}/xz/lib/liblzma.a

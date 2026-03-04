@@ -15,7 +15,7 @@ use std::path::PathBuf;
 ///
 /// let config = Config::builder()
 ///     .num_threads(8)
-///     .segment_length("5k")
+///     .sketch_size(5000)
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
@@ -23,10 +23,11 @@ pub struct Config {
     /// Number of threads (-t)
     pub num_threads: usize,
 
-    /// Percent identity for mapping/alignment (-p)
-    pub map_pct_identity: Option<f64>,
+    /// Percent identity for mapping/alignment (-p).
+    /// Accepts float or ANI preset string like "ani50-2".
+    pub map_pct_identity: Option<String>,
 
-    /// Number of secondary mappings to retain (-n)
+    /// Number of secondary mappings to retain, plane sweep (-n)
     pub num_mappings: Option<usize>,
 
     /// Minimum block length to filter (-l)
@@ -38,8 +39,8 @@ pub struct Config {
     /// Window size for sketching (-w)
     pub window_size: Option<String>,
 
-    /// Segment length (-s)
-    pub segment_length: Option<String>,
+    /// Sketch size (-s)
+    pub sketch_size: Option<usize>,
 
     /// Include self mappings (-X)
     pub self_mappings: bool,
@@ -68,6 +69,12 @@ pub struct Config {
     /// Index batch size (-b)
     pub index_batch_size: Option<String>,
 
+    /// Chain jump / gap (-c)
+    pub chain_jump: Option<String>,
+
+    /// Max mapping length (-P)
+    pub max_length: Option<String>,
+
     /// Temporary directory (sets TMPDIR env var)
     pub temp_dir: Option<PathBuf>,
 
@@ -84,7 +91,7 @@ impl Default for Config {
             block_length: None,
             kmer_size: None,
             window_size: None,
-            segment_length: None,
+            sketch_size: None,
             self_mappings: false,
             prefix_delimiter: None,
             lower_triangular: false,
@@ -94,6 +101,8 @@ impl Default for Config {
             no_filter: false,
             one_to_one: false,
             index_batch_size: None,
+            chain_jump: None,
+            max_length: None,
             temp_dir: None,
             extra_args: Vec::new(),
         }
@@ -107,12 +116,12 @@ impl Config {
     }
 
     /// Build the wfmash CLI arguments from this config.
-    pub(crate) fn to_args(&self) -> Vec<String> {
+    pub fn to_args(&self) -> Vec<String> {
         let mut args = Vec::new();
 
         args.push(format!("-t{}", self.num_threads));
 
-        if let Some(pct) = self.map_pct_identity {
+        if let Some(ref pct) = self.map_pct_identity {
             args.push(format!("-p{}", pct));
         }
 
@@ -132,7 +141,7 @@ impl Config {
             args.push(format!("-w{}", w));
         }
 
-        if let Some(ref s) = self.segment_length {
+        if let Some(s) = self.sketch_size {
             args.push(format!("-s{}", s));
         }
 
@@ -172,6 +181,14 @@ impl Config {
             args.push(format!("-b{}", b));
         }
 
+        if let Some(ref c) = self.chain_jump {
+            args.push(format!("-c{}", c));
+        }
+
+        if let Some(ref p) = self.max_length {
+            args.push(format!("-P{}", p));
+        }
+
         args.extend(self.extra_args.iter().cloned());
 
         args
@@ -193,8 +210,9 @@ impl ConfigBuilder {
     }
 
     /// Sets the percent identity threshold for mapping/alignment (-p).
-    pub fn map_pct_identity(mut self, pct: f64) -> Self {
-        self.config.map_pct_identity = Some(pct);
+    /// Accepts a float value (e.g., 90.0) or an ANI preset string (e.g., "ani50-2").
+    pub fn map_pct_identity(mut self, pct: &str) -> Self {
+        self.config.map_pct_identity = Some(pct.to_string());
         self
     }
 
@@ -216,15 +234,15 @@ impl ConfigBuilder {
         self
     }
 
-    /// Sets the window size for sketching (-w). Accepts suffixed values like "100k".
+    /// Sets the window size for sketching (-w). Accepts suffixed values like "1k".
     pub fn window_size(mut self, w: &str) -> Self {
         self.config.window_size = Some(w.to_string());
         self
     }
 
-    /// Sets the segment length (-s). Accepts suffixed values like "5k".
-    pub fn segment_length(mut self, s: &str) -> Self {
-        self.config.segment_length = Some(s.to_string());
+    /// Sets the sketch size (-s).
+    pub fn sketch_size(mut self, s: usize) -> Self {
+        self.config.sketch_size = Some(s);
         self
     }
 
@@ -279,6 +297,18 @@ impl ConfigBuilder {
     /// Sets the index batch size (-b). Accepts suffixed values like "10M".
     pub fn index_batch_size(mut self, b: &str) -> Self {
         self.config.index_batch_size = Some(b.to_string());
+        self
+    }
+
+    /// Sets the chain jump / gap (-c). Accepts suffixed values like "2k".
+    pub fn chain_jump(mut self, c: &str) -> Self {
+        self.config.chain_jump = Some(c.to_string());
+        self
+    }
+
+    /// Sets the max mapping length (-P). Accepts suffixed values like "50k".
+    pub fn max_length(mut self, p: &str) -> Self {
+        self.config.max_length = Some(p.to_string());
         self
     }
 

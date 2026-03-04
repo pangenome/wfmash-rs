@@ -122,7 +122,8 @@ impl WfmashOrchestrator {
 
     /// Create a temporary file for PAF output.
     fn create_temp_file(&self) -> Result<NamedTempFile> {
-        let builder = tempfile::Builder::new().suffix(".paf");
+        let mut builder = tempfile::Builder::new();
+        builder.suffix(".paf");
         let temp_file = if let Some(ref temp_dir) = self.config.temp_dir {
             builder.tempfile_in(temp_dir)?
         } else {

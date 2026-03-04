@@ -21,7 +21,7 @@
 //!
 //! let config = Config::builder()
 //!     .num_threads(8)
-//!     .segment_length("5k")
+//!     .sketch_size(5000)
 //!     .build();
 //!
 //! let wfmash = Wfmash::new(config)?;
@@ -109,27 +109,27 @@ mod tests {
     fn test_config_builder() {
         let config = Config::builder()
             .num_threads(4)
-            .segment_length("5k")
-            .map_pct_identity(90.0)
+            .sketch_size(5000)
+            .map_pct_identity("90")
             .build();
 
         assert_eq!(config.num_threads, 4);
-        assert_eq!(config.segment_length, Some("5k".to_string()));
-        assert_eq!(config.map_pct_identity, Some(90.0));
+        assert_eq!(config.sketch_size, Some(5000));
+        assert_eq!(config.map_pct_identity, Some("90".to_string()));
     }
 
     #[test]
     fn test_config_to_args() {
         let config = Config::builder()
             .num_threads(8)
-            .segment_length("10k")
+            .sketch_size(10000)
             .self_mappings(true)
             .lower_triangular(true)
             .build();
 
         let args = config.to_args();
         assert!(args.contains(&"-t8".to_string()));
-        assert!(args.contains(&"-s10k".to_string()));
+        assert!(args.contains(&"-s10000".to_string()));
         assert!(args.contains(&"-X".to_string()));
         assert!(args.contains(&"-L".to_string()));
     }

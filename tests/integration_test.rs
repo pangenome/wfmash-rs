@@ -24,14 +24,14 @@ fn test_self_alignment() {
     let test_data = Path::new(env!("CARGO_MANIFEST_DIR")).join("data/test.fa.gz");
 
     if !test_data.exists() {
-        eprintln!("Skipping test_self_alignment: test data not found at {:?}", test_data);
+        eprintln!(
+            "Skipping test_self_alignment: test data not found at {:?}",
+            test_data
+        );
         return;
     }
 
-    let config = Config::builder()
-        .num_threads(4)
-        .segment_length("5k")
-        .build();
+    let config = Config::builder().num_threads(4).build();
 
     let wfmash = match Wfmash::new(config) {
         Ok(w) => w,
@@ -71,10 +71,7 @@ fn test_pairwise_alignment() {
         return;
     }
 
-    let config = Config::builder()
-        .num_threads(4)
-        .segment_length("5k")
-        .build();
+    let config = Config::builder().num_threads(4).build();
 
     let wfmash = match Wfmash::new(config) {
         Ok(w) => w,
@@ -101,10 +98,7 @@ fn test_align_self_to_temp_paf() {
         return;
     }
 
-    let config = Config::builder()
-        .num_threads(4)
-        .segment_length("5k")
-        .build();
+    let config = Config::builder().num_threads(4).build();
 
     let wfmash = match Wfmash::new(config) {
         Ok(w) => w,
@@ -127,8 +121,8 @@ fn test_align_self_to_temp_paf() {
 fn test_config_args_generation() {
     let config = Config::builder()
         .num_threads(16)
-        .segment_length("10k")
-        .map_pct_identity(90.0)
+        .sketch_size(10000)
+        .map_pct_identity("90")
         .num_mappings(5)
         .self_mappings(true)
         .prefix_delimiter('#')
@@ -142,12 +136,14 @@ fn test_config_args_generation() {
         .target_prefix("target")
         .query_prefixes("q1,q2")
         .index_batch_size("10M")
+        .chain_jump("2k")
+        .max_length("50k")
         .build();
 
     let args = config.to_args();
 
     assert!(args.contains(&"-t16".to_string()));
-    assert!(args.contains(&"-s10k".to_string()));
+    assert!(args.contains(&"-s10000".to_string()));
     assert!(args.contains(&"-p90".to_string()));
     assert!(args.contains(&"-n5".to_string()));
     assert!(args.contains(&"-X".to_string()));
@@ -162,4 +158,6 @@ fn test_config_args_generation() {
     assert!(args.contains(&"-Ttarget".to_string()));
     assert!(args.contains(&"-Qq1,q2".to_string()));
     assert!(args.contains(&"-b10M".to_string()));
+    assert!(args.contains(&"-c2k".to_string()));
+    assert!(args.contains(&"-P50k".to_string()));
 }
