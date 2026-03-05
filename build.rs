@@ -41,12 +41,42 @@ fn main() {
     init_submodules(&wfmash_src);
 
     // CMake configure
+    let mut cmake_args = vec![
+        wfmash_src.to_str().unwrap().to_string(),
+        "-DCMAKE_BUILD_TYPE=Release".to_string(),
+        "-DVENDOR_EVERYTHING=ON".to_string(),
+    ];
+
+    // On macOS, Apple clang doesn't support -fopenmp directly.
+    // We need to help CMake find libomp (typically installed via `brew install libomp`).
+    #[cfg(target_os = "macos")]
+    {
+        // Try to find libomp via brew
+        if let Ok(output) = Command::new("brew").args(["--prefix", "libomp"]).output() {
+            if output.status.success() {
+                let libomp_prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                println!("cargo:warning=Found libomp at: {}", libomp_prefix);
+                cmake_args.push(format!(
+                    "-DOpenMP_C_FLAGS=-Xpreprocessor -fopenmp -I{}/include",
+                    libomp_prefix
+                ));
+                cmake_args.push(format!(
+                    "-DOpenMP_CXX_FLAGS=-Xpreprocessor -fopenmp -I{}/include",
+                    libomp_prefix
+                ));
+                cmake_args.push(format!("-DOpenMP_C_LIB_NAMES=omp",));
+                cmake_args.push(format!("-DOpenMP_CXX_LIB_NAMES=omp",));
+                cmake_args.push(format!(
+                    "-DOpenMP_omp_LIBRARY={}/lib/libomp.dylib",
+                    libomp_prefix
+                ));
+            }
+        }
+    }
+
+    let cmake_arg_refs: Vec<&str> = cmake_args.iter().map(|s| s.as_str()).collect();
     let configure_status = Command::new("cmake")
-        .args([
-            wfmash_src.to_str().unwrap(),
-            "-DCMAKE_BUILD_TYPE=Release",
-            "-DVENDOR_EVERYTHING=ON",
-        ])
+        .args(&cmake_arg_refs)
         .current_dir(&build_dir)
         .status()
         .expect("Failed to run cmake configure. Is cmake installed?");
