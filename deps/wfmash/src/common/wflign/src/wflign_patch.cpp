@@ -785,16 +785,16 @@ AlignmentBounds find_alignment_bounds(const alignment_t& aln, const int& erode_k
         bounds.target_start_offset = 0;
     } else {
         // heuristic: subtract erode_k
-        bounds.query_start_offset = std::max((int64_t)0, bounds.query_start_offset - erode_k);
-        bounds.target_start_offset = std::max((int64_t)0, bounds.target_start_offset - erode_k);
+        bounds.query_start_offset = std::max(static_cast<int64_t>(0), bounds.query_start_offset - static_cast<int64_t>(erode_k));
+        bounds.target_start_offset = std::max(static_cast<int64_t>(0), bounds.target_start_offset - static_cast<int64_t>(erode_k));
     }
     if (!found_end) {
         bounds.query_end_offset = aln.query_length;
         bounds.target_end_offset = aln.target_length;
     } else {
         // heuristic: add erode_k
-        bounds.query_end_offset = std::min((int64_t)aln.query_length, bounds.query_end_offset + erode_k);
-        bounds.target_end_offset = std::min((int64_t)aln.target_length, bounds.target_end_offset + erode_k);
+        bounds.query_end_offset = std::min(static_cast<int64_t>(aln.query_length), bounds.query_end_offset + static_cast<int64_t>(erode_k));
+        bounds.target_end_offset = std::min(static_cast<int64_t>(aln.target_length), bounds.target_end_offset + static_cast<int64_t>(erode_k));
     }
 
     // Adjust bounds for reverse complement alignments
