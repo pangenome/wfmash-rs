@@ -41,7 +41,9 @@ fn test_self_alignment() {
         }
     };
 
-    let paf_bytes = wfmash.align_self(&test_data).expect("Self-alignment failed");
+    let paf_bytes = wfmash
+        .align_self(&test_data)
+        .expect("Self-alignment failed");
     assert!(!paf_bytes.is_empty(), "PAF output should not be empty");
 
     // Verify PAF format: each line should have at least 12 tab-separated fields

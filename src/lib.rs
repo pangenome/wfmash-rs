@@ -38,10 +38,10 @@
 //! # }
 //! ```
 
+mod binary_finder;
 pub mod config;
 pub mod error;
 pub mod orchestrator;
-mod binary_finder;
 
 pub use config::Config;
 pub use error::WfmashError;
