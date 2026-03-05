@@ -41,43 +41,30 @@ fn main() {
     init_submodules(&wfmash_src);
 
     // CMake configure
-    let mut cmake_args = vec![
+    let cmake_args = vec![
         wfmash_src.to_str().unwrap().to_string(),
         "-DCMAKE_BUILD_TYPE=Release".to_string(),
         "-DVENDOR_EVERYTHING=ON".to_string(),
     ];
 
+    let mut cmake_cmd = Command::new("cmake");
+    cmake_cmd.args(&cmake_args).current_dir(&build_dir);
+
     // On macOS, Apple clang doesn't support -fopenmp directly.
-    // We need to help CMake find libomp (typically installed via `brew install libomp`).
+    // Use Homebrew GCC which has native OpenMP support.
     #[cfg(target_os = "macos")]
     {
-        // Try to find libomp via brew
-        if let Ok(output) = Command::new("brew").args(["--prefix", "libomp"]).output() {
-            if output.status.success() {
-                let libomp_prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                println!("cargo:warning=Found libomp at: {}", libomp_prefix);
-                cmake_args.push(format!(
-                    "-DOpenMP_C_FLAGS=-Xpreprocessor -fopenmp -I{}/include",
-                    libomp_prefix
-                ));
-                cmake_args.push(format!(
-                    "-DOpenMP_CXX_FLAGS=-Xpreprocessor -fopenmp -I{}/include",
-                    libomp_prefix
-                ));
-                cmake_args.push(format!("-DOpenMP_C_LIB_NAMES=omp",));
-                cmake_args.push(format!("-DOpenMP_CXX_LIB_NAMES=omp",));
-                cmake_args.push(format!(
-                    "-DOpenMP_omp_LIBRARY={}/lib/libomp.dylib",
-                    libomp_prefix
-                ));
-            }
+        if let Some((gcc, gxx)) = find_homebrew_gcc() {
+            println!(
+                "cargo:warning=Using Homebrew GCC for macOS OpenMP support: {}",
+                gcc
+            );
+            cmake_cmd.env("CC", &gcc);
+            cmake_cmd.env("CXX", &gxx);
         }
     }
 
-    let cmake_arg_refs: Vec<&str> = cmake_args.iter().map(|s| s.as_str()).collect();
-    let configure_status = Command::new("cmake")
-        .args(&cmake_arg_refs)
-        .current_dir(&build_dir)
+    let configure_status = cmake_cmd
         .status()
         .expect("Failed to run cmake configure. Is cmake installed?");
 
@@ -124,6 +111,38 @@ fn main() {
 
     println!("cargo:warning=wfmash binary built successfully");
     println!("cargo:rustc-env=WFMASH_BIN_DIR={}", out_dir.display());
+}
+
+/// Find Homebrew GCC on macOS (needed for OpenMP support).
+/// Returns (gcc path, g++ path) if found.
+#[cfg(target_os = "macos")]
+fn find_homebrew_gcc() -> Option<(String, String)> {
+    // Try common GCC version numbers (brew install gcc installs gcc-14, gcc-13, etc.)
+    for version in (11..=15).rev() {
+        let gcc = format!("gcc-{}", version);
+        let gxx = format!("g++-{}", version);
+        if Command::new(&gcc)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Some((gcc, gxx));
+        }
+    }
+    // Try unversioned gcc from brew (unlikely but possible)
+    if let Ok(output) = Command::new("brew").args(["--prefix", "gcc"]).output() {
+        if output.status.success() {
+            let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let gcc = format!("{}/bin/gcc", prefix);
+            let gxx = format!("{}/bin/g++", prefix);
+            if std::path::Path::new(&gcc).exists() {
+                return Some((gcc, gxx));
+            }
+        }
+    }
+    println!("cargo:warning=Homebrew GCC not found. Install with: brew install gcc");
+    None
 }
 
 /// Initialize git submodules in the wfmash source tree if they're not already present.
