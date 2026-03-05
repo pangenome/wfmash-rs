@@ -785,16 +785,16 @@ AlignmentBounds find_alignment_bounds(const alignment_t& aln, const int& erode_k
         bounds.target_start_offset = 0;
     } else {
         // heuristic: subtract erode_k
-        bounds.query_start_offset = std::max((int64_t)0, bounds.query_start_offset - erode_k);
-        bounds.target_start_offset = std::max((int64_t)0, bounds.target_start_offset - erode_k);
+        bounds.query_start_offset = std::max(static_cast<int64_t>(0), bounds.query_start_offset - static_cast<int64_t>(erode_k));
+        bounds.target_start_offset = std::max(static_cast<int64_t>(0), bounds.target_start_offset - static_cast<int64_t>(erode_k));
     }
     if (!found_end) {
         bounds.query_end_offset = aln.query_length;
         bounds.target_end_offset = aln.target_length;
     } else {
         // heuristic: add erode_k
-        bounds.query_end_offset = std::min((int64_t)aln.query_length, bounds.query_end_offset + erode_k);
-        bounds.target_end_offset = std::min((int64_t)aln.target_length, bounds.target_end_offset + erode_k);
+        bounds.query_end_offset = std::min(static_cast<int64_t>(aln.query_length), bounds.query_end_offset + static_cast<int64_t>(erode_k));
+        bounds.target_end_offset = std::min(static_cast<int64_t>(aln.target_length), bounds.target_end_offset + static_cast<int64_t>(erode_k));
     }
 
     // Adjust bounds for reverse complement alignments
@@ -1092,6 +1092,8 @@ void write_merged_alignment(
         const uint64_t& _target_offset,
         const uint64_t& _target_length,
         const float& min_identity,
+        const uint64_t& min_alignment_length,
+        const float& min_block_identity,
 #ifdef WFA_PNG_TSV_TIMING
         const long& elapsed_time_wflambda_ms,
         const uint64_t& num_alignments,
@@ -1260,7 +1262,7 @@ void write_merged_alignment(
             // Head patching
             if (query_start > 0 || target_start > 0) {
                 // Calculate how far we need to shift to cover the query, and how far we can safely shift
-                int64_t needed_shift = std::max(0L, static_cast<int64_t>(query_start) - static_cast<int64_t>(target_start));
+                int64_t needed_shift = std::max(static_cast<int64_t>(0), static_cast<int64_t>(query_start) - static_cast<int64_t>(target_start));
                 int64_t max_safe_shift = std::min(
                     static_cast<int64_t>(wflign_max_len_minor),
                     static_cast<int64_t>(target_offset)
@@ -1650,7 +1652,7 @@ void write_merged_alignment(
             // Tail patching
             if (query_pos < query_length || target_pos < target_length) {
                 // Calculate how much additional target sequence we need
-                int64_t needed_extension = std::max(0L, static_cast<int64_t>(query_length - query_pos) - static_cast<int64_t>(target_length - target_pos));
+                int64_t needed_extension = std::max(static_cast<int64_t>(0), static_cast<int64_t>(query_length - query_pos) - static_cast<int64_t>(target_length - target_pos));
     
                 // Calculate how much we can safely extend
                 int64_t max_safe_extension = std::min(
@@ -2115,13 +2117,14 @@ query_start : query_end)
             (double)cigar_matches /
             (double)(cigar_matches + cigar_mismatches + cigar_insertions + cigar_deletions);
 
-    if (gap_compressed_identity >= min_identity) {
-        const uint64_t edit_distance = cigar_mismatches + cigar_inserted_bp + cigar_deleted_bp;
+    const uint64_t edit_distance = cigar_mismatches + cigar_inserted_bp + cigar_deleted_bp;
 
-        // identity over the full block
-        const double block_identity =
-                (double)cigar_matches / (double)(cigar_matches + edit_distance);
+    // identity over the full block
+    const double block_identity =
+            (double)cigar_matches / (double)(cigar_matches + edit_distance);
 
+    // Apply filtering using configurable thresholds
+    if (gap_compressed_identity >= min_identity && cigar_qAlignedLength >= min_alignment_length && block_identity >= min_block_identity) {
         auto write_tag_and_md_string = [&](std::ostream &out, const char *c,
                                            const int target_start) {
             out << "MD:Z:";
@@ -2344,7 +2347,7 @@ query_start : query_end)
                 out, patch_aln, "", query_name, query_total_length,
                 query_offset, query_length, query_is_rev,
                 target_name, target_total_length, target_offset, target_length,
-                min_identity, mashmap_estimated_identity,
+                min_identity, min_alignment_length, min_block_identity, mashmap_estimated_identity,
                 no_seq_in_sam, emit_md_tag, query, target, target_pointer_shift,
                 0, 0, 0);
         }
@@ -2374,6 +2377,8 @@ query_start : query_end)
                     target_offset,
                     target_length,
                     min_identity,
+                    min_alignment_length,
+                    min_block_identity,
                     mashmap_estimated_identity,
                     0, 0, 0,
                     false,  // Don't add an endline after each alignment
@@ -2486,6 +2491,8 @@ void write_alignment_sam(
     const uint64_t& target_offset,
     const uint64_t& target_length,
     const float& min_identity,
+    const uint64_t& min_alignment_length,
+    const float& min_block_identity,
     const float& mashmap_estimated_identity,
     const bool& no_seq_in_sam,
     const bool& emit_md_tag,
@@ -2550,7 +2557,8 @@ void write_alignment_sam(
         (query_is_rev ? query_offset : query_offset + query_length);
     */
 
-    if (patch_gap_compressed_identity >= min_identity) {
+    // Apply filtering using configurable thresholds
+    if (patch_gap_compressed_identity >= min_identity && patch_qAlignedLength >= min_alignment_length && patch_block_identity >= min_block_identity) {
 
         out << query_name << "\t"
             << (query_is_rev ^ patch_aln.is_rev ? "16" : "0") << "\t"
@@ -2614,6 +2622,8 @@ bool write_alignment_paf(
         const uint64_t& target_offset,
         const uint64_t& target_length, // unused
         const float& min_identity,
+        const uint64_t& min_alignment_length,
+        const float& min_block_identity,
         const float& mashmap_estimated_identity,
         const int32_t& chain_id,
         const int32_t& chain_length,
@@ -2670,7 +2680,8 @@ bool write_alignment_paf(
                 (double)matches /
                 (double)(matches + mismatches + inserted_bp + deleted_bp);
 
-        if (gap_compressed_identity >= min_identity) {
+        // Apply filtering using configurable thresholds
+        if (gap_compressed_identity >= min_identity && qAlignedLength >= min_alignment_length && block_identity >= min_block_identity) {
             uint64_t q_start, q_end;
             // The new aln.j is "new_query_start - query_offset"
             if (query_is_rev) {
