@@ -65,11 +65,15 @@ target_link_libraries(wfmash
   pthread
   libwflign_static
   hts
-  rt
   wfa2cpp
   jemalloc
   z
 )
+
+# librt is needed on Linux but not on macOS (where it doesn't exist)
+if (NOT APPLE)
+  target_link_libraries(wfmash rt)
+endif()
 
 install(TARGETS wfmash DESTINATION bin)
 
