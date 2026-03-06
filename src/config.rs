@@ -15,7 +15,7 @@ use std::path::PathBuf;
 ///
 /// let config = Config::builder()
 ///     .num_threads(8)
-///     .sketch_size(5000)
+///     .segment_length(5000)
 ///     .build();
 /// ```
 #[derive(Debug, Clone)]
@@ -39,8 +39,8 @@ pub struct Config {
     /// Window size for sketching (-w)
     pub window_size: Option<String>,
 
-    /// Sketch size (-s)
-    pub sketch_size: Option<usize>,
+    /// Segment length (-s)
+    pub segment_length: Option<usize>,
 
     /// Include self mappings (-X)
     pub self_mappings: bool,
@@ -91,7 +91,7 @@ impl Default for Config {
             block_length: None,
             kmer_size: None,
             window_size: None,
-            sketch_size: None,
+            segment_length: None,
             self_mappings: false,
             prefix_delimiter: None,
             lower_triangular: false,
@@ -141,7 +141,7 @@ impl Config {
             args.push(format!("-w{}", w));
         }
 
-        if let Some(s) = self.sketch_size {
+        if let Some(s) = self.segment_length {
             args.push(format!("-s{}", s));
         }
 
@@ -240,9 +240,9 @@ impl ConfigBuilder {
         self
     }
 
-    /// Sets the sketch size (-s).
-    pub fn sketch_size(mut self, s: usize) -> Self {
-        self.config.sketch_size = Some(s);
+    /// Sets the segment length (-s).
+    pub fn segment_length(mut self, s: usize) -> Self {
+        self.config.segment_length = Some(s);
         self
     }
 
