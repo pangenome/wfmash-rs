@@ -41,11 +41,23 @@ fn main() {
     init_submodules(&wfmash_src);
 
     // CMake configure
-    let cmake_args = vec![
+    let mut cmake_args = vec![
         wfmash_src.to_str().unwrap().to_string(),
         "-DCMAKE_BUILD_TYPE=Release".to_string(),
         "-DVENDOR_EVERYTHING=ON".to_string(),
     ];
+
+    // Forward CFLAGS/LDFLAGS to cmake so it finds system libraries (e.g. htslib on macOS).
+    if let Ok(cflags) = env::var("CFLAGS") {
+        cmake_args.push(format!("-DCMAKE_C_FLAGS={}", cflags));
+        cmake_args.push(format!("-DCMAKE_CXX_FLAGS={}", cflags));
+    }
+    if let Ok(ldflags) = env::var("LDFLAGS") {
+        cmake_args.push(format!("-DCMAKE_EXE_LINKER_FLAGS={}", ldflags));
+    }
+    if let Ok(prefix_path) = env::var("CMAKE_PREFIX_PATH") {
+        cmake_args.push(format!("-DCMAKE_PREFIX_PATH={}", prefix_path));
+    }
 
     let mut cmake_cmd = Command::new("cmake");
     cmake_cmd.args(&cmake_args).current_dir(&build_dir);
