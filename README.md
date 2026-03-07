@@ -1,5 +1,7 @@
 # wfmash-rs
 
+[![CI](https://github.com/pangenome/wfmash-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/pangenome/wfmash-rs/actions/workflows/ci.yml)
+
 Rust bindings for the [wfmash](https://github.com/waveygang/wfmash) whole-genome aligner.
 
 ## Features
@@ -27,7 +29,7 @@ use std::path::Path;
 
 let config = Config::builder()
     .num_threads(8)
-    .block_length(10000)
+    .segment_length(5000)
     .build();
 
 let wfmash = Wfmash::new(config)?;
@@ -51,10 +53,10 @@ println!("PAF at: {}", temp_paf.path().display());
 ```rust
 let config = Config::builder()
     .num_threads(8)              // -t: threads (default: all CPUs)
+    .segment_length(5000)        // -s: segment length
     .block_length(10000)         // -l: minimum alignment block length
     .map_pct_identity("90")      // -p: minimum mapping identity %
     .num_mappings(5)             // -n: max mappings per segment
-    .sketch_size(5000)           // -s: sketch size
     .kmer_size(19)               // -k: kmer size
     .self_mappings(true)         // -X: include self mappings
     .prefix_delimiter('#')       // -Y: PanSN prefix delimiter
@@ -67,9 +69,22 @@ let config = Config::builder()
 
 ## Build requirements
 
-- C++ compiler (for building vendored wfmash)
-- CMake
-- zlib, GSL
+- C++ compiler with C++17 support
+- CMake >= 3.5
+- GSL (GNU Scientific Library)
+- htslib
+- jemalloc
+- zlib
+
+On Ubuntu/Debian:
+```bash
+sudo apt-get install cmake libgsl-dev libhts-dev libjemalloc-dev zlib1g-dev
+```
+
+On macOS:
+```bash
+brew install cmake gsl htslib jemalloc
+```
 
 ## License
 
