@@ -123,7 +123,7 @@ fn test_align_self_to_temp_paf() {
 fn test_config_args_generation() {
     let config = Config::builder()
         .num_threads(16)
-        .sketch_size(10000)
+        .segment_length(10000)
         .map_pct_identity("90")
         .num_mappings(5)
         .self_mappings(true)
