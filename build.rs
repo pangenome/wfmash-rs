@@ -59,6 +59,13 @@ fn main() {
         cmake_args.push(format!("-DCMAKE_PREFIX_PATH={}", prefix_path));
     }
 
+    // Build portable binary (no -march=native) when WFMASH_PORTABLE=1.
+    // Useful for CI where cached binaries may run on different CPU types.
+    if env::var("WFMASH_PORTABLE").unwrap_or_default() == "1" {
+        println!("cargo:warning=Building portable wfmash (no -march=native)");
+        cmake_args.push("-DPORTABLE=ON".to_string());
+    }
+
     let mut cmake_cmd = Command::new("cmake");
     cmake_cmd.args(&cmake_args).current_dir(&build_dir);
 
