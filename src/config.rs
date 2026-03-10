@@ -63,7 +63,7 @@ pub struct Config {
     /// Disable mapping filtering (-f)
     pub no_filter: bool,
 
-    /// Enable one-to-one mapping (-o)
+    /// Enable one-to-one mapping (-4)
     pub one_to_one: bool,
 
     /// Index batch size (-b)
@@ -80,6 +80,9 @@ pub struct Config {
 
     /// Extra arguments to pass directly to wfmash
     pub extra_args: Vec<String>,
+
+    /// File containing allowed query<TAB>target pairs (--pairs-file)
+    pub pairs_file: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -105,6 +108,7 @@ impl Default for Config {
             max_length: None,
             temp_dir: None,
             extra_args: Vec::new(),
+            pairs_file: None,
         }
     }
 }
@@ -174,7 +178,7 @@ impl Config {
         }
 
         if self.one_to_one {
-            args.push("-o".to_string());
+            args.push("-4".to_string());
         }
 
         if let Some(ref b) = self.index_batch_size {
@@ -187,6 +191,11 @@ impl Config {
 
         if let Some(ref p) = self.max_length {
             args.push(format!("-P{}", p));
+        }
+
+        if let Some(ref pf) = self.pairs_file {
+            args.push("--pairs-file".to_string());
+            args.push(pf.to_string_lossy().to_string());
         }
 
         args.extend(self.extra_args.iter().cloned());
@@ -288,7 +297,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Enable one-to-one mapping (-o).
+    /// Enable one-to-one mapping (-4).
     pub fn one_to_one(mut self, enabled: bool) -> Self {
         self.config.one_to_one = enabled;
         self
@@ -321,6 +330,12 @@ impl ConfigBuilder {
     /// Add extra arguments to pass directly to wfmash.
     pub fn extra_args(mut self, args: Vec<String>) -> Self {
         self.config.extra_args = args;
+        self
+    }
+
+    /// Sets the pairs file for allowed query-target pairs (--pairs-file).
+    pub fn pairs_file(mut self, path: PathBuf) -> Self {
+        self.config.pairs_file = Some(path);
         self
     }
 

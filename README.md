@@ -61,8 +61,9 @@ let config = Config::builder()
     .self_mappings(true)         // -X: include self mappings
     .prefix_delimiter('#')       // -Y: PanSN prefix delimiter
     .lower_triangular(true)      // -L: lower-triangular output only
-    .one_to_one(true)            // -o: one-to-one mapping
+    .one_to_one(true)            // -4: one-to-one mapping
     .no_filter(true)             // -f: disable mapping filtering
+    .pairs_file(PathBuf::from("pairs.tsv"))  // --pairs-file: restrict to allowed pairs
     .temp_dir(PathBuf::from("/tmp"))  // TMPDIR for temp files
     .build();
 ```
