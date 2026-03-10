@@ -66,9 +66,6 @@ pub struct Config {
     /// Enable one-to-one mapping (-4)
     pub one_to_one: bool,
 
-    /// Index batch size (-b)
-    pub index_batch_size: Option<String>,
-
     /// Chain jump / gap (-c)
     pub chain_jump: Option<String>,
 
@@ -103,7 +100,6 @@ impl Default for Config {
             query_prefixes: None,
             no_filter: false,
             one_to_one: false,
-            index_batch_size: None,
             chain_jump: None,
             max_length: None,
             temp_dir: None,
@@ -179,10 +175,6 @@ impl Config {
 
         if self.one_to_one {
             args.push("-4".to_string());
-        }
-
-        if let Some(ref b) = self.index_batch_size {
-            args.push(format!("-b{}", b));
         }
 
         if let Some(ref c) = self.chain_jump {
@@ -300,12 +292,6 @@ impl ConfigBuilder {
     /// Enable one-to-one mapping (-4).
     pub fn one_to_one(mut self, enabled: bool) -> Self {
         self.config.one_to_one = enabled;
-        self
-    }
-
-    /// Sets the index batch size (-b). Accepts suffixed values like "10M".
-    pub fn index_batch_size(mut self, b: &str) -> Self {
-        self.config.index_batch_size = Some(b.to_string());
         self
     }
 

@@ -137,7 +137,6 @@ fn test_config_args_generation() {
         .block_length(1000)
         .target_prefix("target")
         .query_prefixes("q1,q2")
-        .index_batch_size("10M")
         .chain_jump("2k")
         .max_length("50k")
         .build();
@@ -159,7 +158,6 @@ fn test_config_args_generation() {
     assert!(args.contains(&"-l1000".to_string()));
     assert!(args.contains(&"-Ttarget".to_string()));
     assert!(args.contains(&"-Qq1,q2".to_string()));
-    assert!(args.contains(&"-b10M".to_string()));
     assert!(args.contains(&"-c2k".to_string()));
     assert!(args.contains(&"-P50k".to_string()));
 }
