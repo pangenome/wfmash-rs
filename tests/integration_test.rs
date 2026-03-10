@@ -153,7 +153,7 @@ fn test_config_args_generation() {
     assert!(args.contains(&"-L".to_string()));
     assert!(args.contains(&"-m".to_string()));
     assert!(args.contains(&"-f".to_string()));
-    assert!(args.contains(&"-o".to_string()));
+    assert!(args.contains(&"-4".to_string()));
     assert!(args.contains(&"-k19".to_string()));
     assert!(args.contains(&"-w100".to_string()));
     assert!(args.contains(&"-l1000".to_string()));
