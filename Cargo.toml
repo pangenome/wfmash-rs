@@ -22,7 +22,6 @@ thiserror = "1.0"
 anyhow = "1.0"
 tempfile = "3.8"
 num_cpus = "1.16"
-which = "6.0"
 
 [build-dependencies]
 # We use std::process::Command directly for CMake

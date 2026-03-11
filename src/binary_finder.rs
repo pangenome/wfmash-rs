@@ -6,7 +6,9 @@
 //! 3. OUT_DIR from build.rs (development builds)
 //! 4. $WFMASH_BIN or $WFMASH_BIN_DIR env var
 //! 5. Cargo build directories (development)
-//! 6. System PATH via which::which
+//!
+//! The system PATH is intentionally NOT searched to avoid version
+//! mismatches with a globally installed wfmash.
 
 use crate::error::{Result, WfmashError};
 use std::path::PathBuf;
@@ -108,11 +110,6 @@ fn find_binary(name: &str) -> Result<PathBuf> {
                 }
             }
         }
-    }
-
-    // 6. System PATH
-    if let Ok(path) = which::which(name) {
-        return Ok(path);
     }
 
     Err(WfmashError::BinaryNotFound)
