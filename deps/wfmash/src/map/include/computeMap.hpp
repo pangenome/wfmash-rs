@@ -17,6 +17,7 @@
 #include <zlib.h>
 #include <cassert>
 #include <numeric>
+#include <cstring>
 #include <iostream>
 #include <filesystem>
 namespace fs = std::filesystem;
@@ -47,6 +48,154 @@ namespace fs = std::filesystem;
 
 namespace skch
 {
+  /**
+   * @brief  LSD radix sort of interval points in [start, end) by (seqId, pos, side),
+   *         reproducing IntervalPoint::operator< order. Replaces std::sort, which
+   *         dominates mapping self-time at scale (all-vs-all makes the point count grow).
+   *         (seqId, pos, side) are packed into an order-preserving uint64 key; ties among
+   *         equal keys (same seqId/pos/side, differing hash) are order-insensitive downstream
+   *         (verified byte-identical), so a stable radix is safe. Falls back to std::sort for
+   *         small ranges or keys outside the packable range. thread_local scratch is reused to
+   *         avoid per-call allocation (called once per query fragment).
+   */
+  template <typename Vec>
+  inline void radixSortIntervalPoints(Vec& ip, std::size_t start)
+  {
+    const std::size_t n = ip.size() - start;
+    if (n < 128) {                         // radix setup not worth it for tiny ranges
+      std::sort(ip.begin() + start, ip.end());
+      return;
+    }
+
+    thread_local std::vector<uint64_t> keys;
+    keys.resize(n);
+    // Pack: [ seqId : bits 33..63 ][ pos : bits 1..32 ][ sideOpen : bit 0 ]
+    // side::CLOSE(-1)->0, side::OPEN(1)->1, so CLOSE sorts before OPEN (matches operator<).
+    for (std::size_t i = 0; i < n; ++i) {
+      const IntervalPoint& p = ip[start + i];
+      if (p.seqId < 0 || p.pos < 0 ||
+          (uint64_t)p.seqId >= (UINT64_C(1) << 31) ||
+          (uint64_t)p.pos   >= (UINT64_C(1) << 32)) {   // out of packable range: bail
+        std::sort(ip.begin() + start, ip.end());
+        return;
+      }
+      const uint64_t sideOpen = (p.side == side::OPEN) ? 1u : 0u;
+      keys[i] = ((uint64_t)(uint32_t)p.seqId << 33) | ((uint64_t)p.pos << 1) | sideOpen;
+    }
+
+    // 11-bit radix digits: 6 passes over a 64-bit key instead of 8 byte-passes, so
+    // ~40% fewer index-scatter passes (this sort is movement-bound). 2048-bucket
+    // histograms fit in L2. constant-digit passes are skipped, so in practice only
+    // the ~3 populated digits (small seqId/pos) are scattered.
+    constexpr int RB = 11;
+    constexpr int RN = 1 << RB;          // 2048 buckets
+    constexpr uint64_t RM = RN - 1;
+    constexpr int NP = (64 + RB - 1) / RB;   // 6 passes
+    thread_local std::vector<std::size_t> histbuf;
+    histbuf.assign((std::size_t)NP * RN, 0);
+    for (std::size_t i = 0; i < n; ++i) {
+      const uint64_t k = keys[i];
+      for (int d = 0; d < NP; ++d) histbuf[(std::size_t)d * RN + ((k >> (d * RB)) & RM)]++;
+    }
+
+    thread_local std::vector<uint32_t> ordA, ordB;
+    ordA.resize(n); ordB.resize(n);
+    for (uint32_t i = 0; i < (uint32_t)n; ++i) ordA[i] = i;
+    uint32_t* src = ordA.data();
+    uint32_t* dst = ordB.data();
+
+    for (int d = 0; d < NP; ++d) {
+      std::size_t* h = histbuf.data() + (std::size_t)d * RN;
+      if (h[(keys[src[0]] >> (d * RB)) & RM] == n) continue;   // constant digit: skip pass
+      std::size_t sum = 0;
+      for (int c = 0; c < RN; ++c) { std::size_t t = h[c]; h[c] = sum; sum += t; }
+      for (std::size_t i = 0; i < n; ++i) {
+        const uint32_t idx = src[i];
+        const uint32_t c = (uint32_t)((keys[idx] >> (d * RB)) & RM);
+        dst[h[c]++] = idx;
+      }
+      std::swap(src, dst);
+    }
+
+    // Gather the permutation into scratch, then write back.
+    thread_local std::vector<typename Vec::value_type> tmp;
+    tmp.resize(n);
+    for (std::size_t i = 0; i < n; ++i) tmp[i] = ip[start + src[i]];
+    std::copy(tmp.begin(), tmp.end(), ip.begin() + start);
+  }
+
+  // ---- Packed interval-point representation (IP-1) ----
+  // When windowLen == 0 (the default split fragmentation) the plane sweep never
+  // reads IntervalPoint::hash, so interval points can be represented as the same
+  // order-preserving uint64 key the radix sort already uses:
+  //   [ seqId : bits 33..63 ][ pos : bits 1..32 ][ sideOpen : bit 0 ]
+  // (side::CLOSE(-1)->0, side::OPEN(1)->1, so numeric key order == operator<).
+  // This drops the 24-byte struct and its scattered gather from the sort and cuts
+  // the plane sweep's memory traffic ~3x. Byte-identical for windowLen == 0.
+  inline uint64_t encodePackedIP(const IntervalPoint& p) {
+    return ((uint64_t)(uint32_t)p.seqId << 33) | ((uint64_t)p.pos << 1)
+         | (uint64_t)(p.side == side::OPEN ? 1u : 0u);
+  }
+  inline IntervalPoint decodePackedIP(uint64_t k) {
+    IntervalPoint ip;
+    ip.pos   = (offset_t)((k >> 1) & 0xFFFFFFFFULL);
+    ip.hash  = 0;                                   // dead when windowLen == 0
+    ip.seqId = (seqno_t)(k >> 33);
+    ip.side  = (k & 1) ? side::OPEN : side::CLOSE;
+    return ip;
+  }
+
+  // Forward iterator over packed keys presenting each as a decoded IntervalPoint,
+  // so computeL1CandidateRegions can consume packed keys unchanged.
+  struct PackedIPCursor {
+    const uint64_t* p;
+    struct Arrow {
+      IntervalPoint ip;
+      const IntervalPoint* operator->() const { return &ip; }
+    };
+    IntervalPoint operator*()  const { return decodePackedIP(*p); }
+    Arrow         operator->() const { return Arrow{ decodePackedIP(*p) }; }
+    PackedIPCursor& operator++()    { ++p; return *this; }
+    PackedIPCursor  operator++(int) { PackedIPCursor t = *this; ++p; return t; }
+    bool operator==(const PackedIPCursor& o) const { return p == o.p; }
+    bool operator!=(const PackedIPCursor& o) const { return p != o.p; }
+  };
+
+  // In-place LSD radix sort of packed uint64 keys in [start,end): 11-bit digits,
+  // constant-digit skip, std::sort fallback for tiny ranges. The keys themselves
+  // are the payload -- no index array, no struct gather.
+  inline void radixSortPackedKeys(std::vector<uint64_t>& keys, std::size_t start) {
+    const std::size_t n = keys.size() - start;
+    if (n < 128) { std::sort(keys.begin() + start, keys.end()); return; }
+    thread_local std::vector<uint64_t> buf;
+    buf.resize(n);
+    uint64_t* a = keys.data() + start;
+    uint64_t* b = buf.data();
+
+    constexpr int RB = 11, RN = 1 << RB, NP = (64 + RB - 1) / RB;
+    constexpr uint64_t RM = RN - 1;
+    thread_local std::vector<std::size_t> histbuf;
+    histbuf.assign((std::size_t)NP * RN, 0);
+    for (std::size_t i = 0; i < n; ++i) {
+      const uint64_t k = a[i];
+      for (int d = 0; d < NP; ++d) histbuf[(std::size_t)d * RN + ((k >> (d * RB)) & RM)]++;
+    }
+    uint64_t* src = a;
+    uint64_t* dst = b;
+    for (int d = 0; d < NP; ++d) {
+      std::size_t* h = histbuf.data() + (std::size_t)d * RN;
+      if (h[(src[0] >> (d * RB)) & RM] == n) continue;   // constant digit: skip
+      std::size_t sum = 0;
+      for (int c = 0; c < RN; ++c) { std::size_t t = h[c]; h[c] = sum; sum += t; }
+      for (std::size_t i = 0; i < n; ++i) {
+        const uint64_t k = src[i];
+        dst[h[(k >> (d * RB)) & RM]++] = k;
+      }
+      std::swap(src, dst);
+    }
+    if (src != a) std::copy(src, src + n, a);   // odd #passes: result is in buf
+  }
+
   /**
    * @class     skch::Map
    * @brief     L1 and L2 mapping stages
@@ -113,6 +262,14 @@ namespace skch
       //if refIdGroup[i] == refIdGroup[j], then sequence i and j have the same prefix;
       std::vector<int> refIdGroup;
 
+      // True if every reference position fits in 32 bits and seqId in 31 bits, so
+      // interval points can use the compact packed-uint64 representation (IP-1).
+      bool packed_ip_ok = false;
+
+      // Reference sequence name -> seqId, so the per-interval-point skip_self test can be
+      // an integer compare (queryRefId != ip.seqId) instead of a std::string comparison.
+      ankerl::unordered_dense::map<std::string, seqno_t> refNameToId;
+
       // Allowed (query, target) pairs from --pairs-file
       std::unordered_set<std::string> allowed_pairs;
       std::unordered_set<std::string> allowed_queries_from_pairs;
@@ -142,6 +299,19 @@ namespace skch
       }
       if (!p.pairs_file.empty()) {
         this->loadPairsFile(p.pairs_file);
+      }
+      // Decide once whether the compact packed interval-point path is usable.
+      {
+        bool ok = refSketch.metadata.size() <= (size_t)0x7FFFFFFF;
+        for (const auto& m : refSketch.metadata) {
+          if (m.len < 0 || (uint64_t)m.len >= (UINT64_C(1) << 32)) { ok = false; break; }
+        }
+        this->packed_ip_ok = ok;
+      }
+      // Build reference name -> seqId once (for the integer skip_self test).
+      this->refNameToId.reserve(refSketch.metadata.size());
+      for (seqno_t i = 0; i < (seqno_t)refSketch.metadata.size(); ++i) {
+        this->refNameToId[refSketch.metadata[i].name] = i;
       }
       this->mapQuery();
     }
@@ -193,6 +363,13 @@ namespace skch
           }
         }
         std::cerr << "[mashmap::skch::Map::loadPairsFile] Loaded " << allowed_pairs.size() << " allowed pairs from " << filename << std::endl;
+      }
+
+      // Reference seqId whose name equals seqName, or -1 if none (for skip_self).
+      seqno_t queryRefSeqId(const std::string& seqName) const
+      {
+        const auto it = refNameToId.find(seqName);
+        return it != refNameToId.end() ? it->second : (seqno_t)-1;
       }
 
       // Gets the ref group of a query based on the prefix
@@ -939,50 +1116,69 @@ namespace skch
           if(Q.minmerTableQuery.size() == 0)
             return;
 
-          // Priority queue for sorting interval points
-          using IP_const_iterator = std::vector<IntervalPoint>::const_iterator;
-          std::vector<boundPtr<IP_const_iterator>> pq;
-          pq.reserve(Q.sketchSize);
-          constexpr auto heap_cmp = [](const auto& a, const auto& b) {return b < a;};
-
+          // Gather matched interval points directly during the reference lookup
+          // (no separate priority-queue pass; radixSortIntervalPoints sorts afterwards).
+          const size_t ip_start = intervalPoints.size();
+          const seqno_t queryRefId = param.skip_self ? this->queryRefSeqId(Q.seqName) : (seqno_t)-1;
           for(auto it = Q.minmerTableQuery.begin(); it != Q.minmerTableQuery.end(); it++)
           {
             //Check if hash value exists in the reference lookup index
             const auto seedFind = refSketch.minmerPosLookupIndex.find(it->hash);
+            if(seedFind == refSketch.minmerPosLookupIndex.end())
+              continue;
 
-            if(seedFind != refSketch.minmerPosLookupIndex.end())
+            for (const auto& ip : seedFind->second)
             {
-              pq.emplace_back(boundPtr<IP_const_iterator> {seedFind->second.cbegin(), seedFind->second.cend()});
+              if ((!param.skip_self || queryRefId != ip.seqId)
+                  && (!param.skip_prefix || this->refIdGroup[ip.seqId] != Q.refGroup)
+                  && (!param.lower_triangular || Q.seqCounter > ip.seqId)
+                  && (allowed_pairs.empty()
+                      || allowed_pairs.count(Q.seqName + "\t" + this->refSketch.metadata[ip.seqId].name))
+              ) {
+                intervalPoints.push_back(ip);
+              }
             }
           }
-          std::make_heap(pq.begin(), pq.end(), heap_cmp);
-
-          while(!pq.empty())
-          {
-            const IP_const_iterator ip_it = pq.front().it;
-            const auto& ref = this->refSketch.metadata[ip_it->seqId];
-            if ((!param.skip_self || Q.seqName != ref.name)
-                && (!param.skip_prefix || this->refIdGroup[ip_it->seqId] != Q.refGroup)
-                && (!param.lower_triangular || Q.seqCounter > ip_it->seqId)
-                && (allowed_pairs.empty() || allowed_pairs.count(Q.seqName + "\t" + ref.name))
-            ) {
-              intervalPoints.push_back(*ip_it);
-            }
-            std::pop_heap(pq.begin(), pq.end(), heap_cmp);
-            pq.back().it++;
-            if (pq.back().it >= pq.back().end) 
-            {
-              pq.pop_back();
-            }
-            else
-            {
-              std::push_heap(pq.begin(), pq.end(), heap_cmp);
-            }
-          }
+          radixSortIntervalPoints(intervalPoints, ip_start);
 
 #ifdef DEBUG
           std::cerr << "INFO, skch::Map:getSeedHits, read id " << Q.seqCounter << ", Count of seed hits in the reference = " << intervalPoints.size() / 2 << "\n";
 #endif
+        }
+
+      /**
+       * @brief  Packed-key variant of getSeedIntervalPoints (IP-1): produces the same
+       *         filtered, order-preserving-key-sorted set of interval points as
+       *         encodePackedIP(uint64) instead of 24-byte IntervalPoint structs.
+       *         Used only when windowLen == 0, where IntervalPoint::hash is unused.
+       */
+      template <typename Q_Info>
+        void getSeedIntervalPointsPacked(Q_Info &Q, std::vector<uint64_t>& packed)
+        {
+          if(Q.minmerTableQuery.size() == 0)
+            return;
+
+          const std::size_t start = packed.size();
+          const seqno_t queryRefId = param.skip_self ? this->queryRefSeqId(Q.seqName) : (seqno_t)-1;
+          for(auto it = Q.minmerTableQuery.begin(); it != Q.minmerTableQuery.end(); it++)
+          {
+            const auto seedFind = refSketch.minmerPosLookupIndex.find(it->hash);
+            if(seedFind == refSketch.minmerPosLookupIndex.end())
+              continue;
+
+            for (const auto& ip : seedFind->second)
+            {
+              if ((!param.skip_self || queryRefId != ip.seqId)
+                  && (!param.skip_prefix || this->refIdGroup[ip.seqId] != Q.refGroup)
+                  && (!param.lower_triangular || Q.seqCounter > ip.seqId)
+                  && (allowed_pairs.empty()
+                      || allowed_pairs.count(Q.seqName + "\t" + this->refSketch.metadata[ip.seqId].name))
+              ) {
+                packed.push_back(encodePackedIP(ip));
+              }
+            }
+          }
+          radixSortPackedKeys(packed, start);
         }
 
 
@@ -1211,11 +1407,44 @@ namespace skch
             return;
           }
 
-          //2. Compute windows and sort
-          getSeedIntervalPoints(Q, intervalPoints);
-
           //3. Compute L1 windows
           int minimumHits = Stat::estimateMinimumHitsRelaxed(Q.sketchSize, param.kmerSize, param.percentageIdentity, skch::fixed::confidence_interval);
+
+          // Fast packed-key path: windowLen == max(0, Q.len - segLength) is 0 here
+          // (Q.len <= segLength, the default split fragmentation), so IntervalPoint::hash
+          // is unused and interval points can be compact uint64 keys -- no 24-byte struct,
+          // no scattered gather in the sort. Byte-identical to the struct path below.
+          if (this->packed_ip_ok && Q.len <= param.segLength)
+          {
+            thread_local std::vector<uint64_t> packedPoints;
+            packedPoints.clear();
+            getSeedIntervalPointsPacked(Q, packedPoints);
+
+            const std::size_t np = packedPoints.size();
+            std::size_t b = 0;
+            while (b < np)
+            {
+              std::size_t e;
+              if (param.skip_prefix)
+              {
+                const int currGroup = this->refIdGroup[(seqno_t)(packedPoints[b] >> 33)];
+                e = b;
+                while (e < np && this->refIdGroup[(seqno_t)(packedPoints[e] >> 33)] == currGroup) ++e;
+              }
+              else
+              {
+                e = np;
+              }
+              computeL1CandidateRegions(Q, PackedIPCursor{packedPoints.data() + b},
+                                            PackedIPCursor{packedPoints.data() + e},
+                                            minimumHits, l1Mappings);
+              b = e;
+            }
+            return;
+          }
+
+          //2. Compute windows and sort (struct path; also handles windowLen != 0)
+          getSeedIntervalPoints(Q, intervalPoints);
 
           // For each "group"
           auto ip_begin = intervalPoints.begin();

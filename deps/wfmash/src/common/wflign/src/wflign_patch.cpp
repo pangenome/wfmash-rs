@@ -391,6 +391,9 @@ void write_merged_alignment(
                                    const uint16_t &min_wfa_head_tail_patch_length,
                                    const uint16_t &min_wfa_patch_length,
                                    const uint16_t &max_dist_to_look_at) {
+            // Patched CIGAR is ~unpatched size plus gap-fill ops; reserve to avoid
+            // repeated reallocation of this per-alignment vector (capacity only).
+            patched.reserve(patched.size() + unpatched.size());
             auto q = unpatched.begin();
 
             uint64_t query_pos = query_start;
@@ -1708,24 +1711,12 @@ query_start : query_end)
                     query_offset +
                     (query_is_rev ? query_length - query_start : query_end);
 
-            if (query_is_rev) {
-                if (query_length > query_end_pos) {
-                    out << (query_length - query_end_pos) << "H";
-                }
-            } else {
-                if (query_start_pos > 0) {
-                    out << query_start_pos << "H";
-                }
+            if (query_start_pos > 0) {
+                out << query_start_pos << "H";
             }
             out << cigarv;
-            if (query_is_rev) {
-                if (query_start_pos > 0) {
-                    out << query_start_pos << "H";
-                }
-            } else {
-                if (query_length > query_end_pos) {
-                    out << (query_length - query_end_pos) << "H";
-                }
+            if (query_total_length > query_end_pos) {
+                out << (query_total_length - query_end_pos) << "H";
             }
 
             out << "\t"
