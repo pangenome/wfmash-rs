@@ -55,10 +55,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if (${CMAKE_BUILD_TYPE} MATCHES Release)
-  if (NOT PORTABLE)
-    set(OPTIMIZE_FLAGS "${OPTIMIZE_FLAGS} -march=native")
-  endif()
-  set(OPTIMIZE_FLAGS "${OPTIMIZE_FLAGS} -D_FILE_OFFSET_BITS=64")
+  set(OPTIMIZE_FLAGS "${OPTIMIZE_FLAGS} -march=native -D_FILE_OFFSET_BITS=64")
 endif()
 
 if ((${CMAKE_BUILD_TYPE} MATCHES Release) OR (${CMAKE_BUILD_TYPE} MATCHES RelWithDebInfo))
