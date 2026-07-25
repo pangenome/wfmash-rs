@@ -71,9 +71,16 @@ fn main() {
 
     // On macOS, Apple clang doesn't support -fopenmp directly.
     // Use Homebrew GCC which has native OpenMP support.
+    //
+    // A caller that already picked a compiler wins: conda sets CC and CXX, and
+    // its SDK is not the one Homebrew GCC expects, so forcing GCC there fails
+    // to parse the system headers.
     #[cfg(target_os = "macos")]
     {
-        if let Some((gcc, gxx)) = find_homebrew_gcc() {
+        let caller_set_cc = env::var_os("CC").is_some() && env::var_os("CXX").is_some();
+        if caller_set_cc {
+            println!("cargo:warning=Using CC/CXX from the environment, not Homebrew GCC");
+        } else if let Some((gcc, gxx)) = find_homebrew_gcc() {
             println!(
                 "cargo:warning=Using Homebrew GCC for macOS OpenMP support: {}",
                 gcc
