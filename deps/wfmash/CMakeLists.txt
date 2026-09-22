@@ -19,9 +19,14 @@ endif()
 
 message(STATUS "CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 
+option(PORTABLE "Build portable binary (no -march=native)" OFF)
+
 if (${CMAKE_BUILD_TYPE} MATCHES Release)
-    #set(EXTRA_FLAGS "-Ofast -march=native -flto -fno-fat-lto-objects")
-    set(EXTRA_FLAGS "-Ofast -march=native")
+    if (PORTABLE)
+        set(EXTRA_FLAGS "-Ofast")
+    else()
+        set(EXTRA_FLAGS "-Ofast -march=native")
+    endif()
     set(CMAKE_CXX_FLAGS_RELEASE "-DNDEBUG") # reset CXX_FLAGS to replace -O3 with -Ofast
 endif ()
 
