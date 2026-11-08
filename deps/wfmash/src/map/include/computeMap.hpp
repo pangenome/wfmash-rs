@@ -123,42 +123,8 @@ namespace skch
     std::copy(tmp.begin(), tmp.end(), ip.begin() + start);
   }
 
-  // ---- Packed interval-point representation (IP-1) ----
-  // When windowLen == 0 (the default split fragmentation) the plane sweep never
-  // reads IntervalPoint::hash, so interval points can be represented as the same
-  // order-preserving uint64 key the radix sort already uses:
-  //   [ seqId : bits 33..63 ][ pos : bits 1..32 ][ sideOpen : bit 0 ]
-  // (side::CLOSE(-1)->0, side::OPEN(1)->1, so numeric key order == operator<).
-  // This drops the 24-byte struct and its scattered gather from the sort and cuts
-  // the plane sweep's memory traffic ~3x. Byte-identical for windowLen == 0.
-  inline uint64_t encodePackedIP(const IntervalPoint& p) {
-    return ((uint64_t)(uint32_t)p.seqId << 33) | ((uint64_t)p.pos << 1)
-         | (uint64_t)(p.side == side::OPEN ? 1u : 0u);
-  }
-  inline IntervalPoint decodePackedIP(uint64_t k) {
-    IntervalPoint ip;
-    ip.pos   = (offset_t)((k >> 1) & 0xFFFFFFFFULL);
-    ip.hash  = 0;                                   // dead when windowLen == 0
-    ip.seqId = (seqno_t)(k >> 33);
-    ip.side  = (k & 1) ? side::OPEN : side::CLOSE;
-    return ip;
-  }
-
-  // Forward iterator over packed keys presenting each as a decoded IntervalPoint,
-  // so computeL1CandidateRegions can consume packed keys unchanged.
-  struct PackedIPCursor {
-    const uint64_t* p;
-    struct Arrow {
-      IntervalPoint ip;
-      const IntervalPoint* operator->() const { return &ip; }
-    };
-    IntervalPoint operator*()  const { return decodePackedIP(*p); }
-    Arrow         operator->() const { return Arrow{ decodePackedIP(*p) }; }
-    PackedIPCursor& operator++()    { ++p; return *this; }
-    PackedIPCursor  operator++(int) { PackedIPCursor t = *this; ++p; return t; }
-    bool operator==(const PackedIPCursor& o) const { return p == o.p; }
-    bool operator!=(const PackedIPCursor& o) const { return p != o.p; }
-  };
+  // encodePackedIP / decodePackedIP / PackedIPCursor live in base_types.hpp
+  // (winSketch.hpp uses them to build the CSR position-lookup arena).
 
   // In-place LSD radix sort of packed uint64 keys in [start,end): 11-bit digits,
   // constant-digit skip, std::sort fallback for tiny ranges. The keys themselves
@@ -273,6 +239,16 @@ namespace skch
       std::unordered_set<std::string> allowed_pairs;
       std::unordered_set<std::string> allowed_queries_from_pairs;
 
+      // Memoized Stat::estimateMinimumHitsRelaxed for every possible Q.sketchSize;
+      // all its other arguments are run constants, so this avoids the per-fragment
+      // GSL binomial-CDF loops.
+      std::vector<int> minHitsCache;
+
+      // Per-seqId start offsets into refSketch.minmerIndex (globally sorted by
+      // (seqId, wpos)), so the per-candidate lower_bound searches one contig
+      // instead of the whole index.
+      std::vector<size_t> minmerIndexSeqStart;
+
     public:
 
       /**
@@ -299,18 +275,31 @@ namespace skch
       if (!p.pairs_file.empty()) {
         this->loadPairsFile(p.pairs_file);
       }
-      // Decide once whether the compact packed interval-point path is usable.
-      {
-        bool ok = refSketch.metadata.size() <= (size_t)0x7FFFFFFF;
-        for (const auto& m : refSketch.metadata) {
-          if (m.len < 0 || (uint64_t)m.len >= (UINT64_C(1) << 32)) { ok = false; break; }
-        }
-        this->packed_ip_ok = ok;
-      }
+      // The compact packed interval-point path is usable exactly when the Sketch
+      // flattened its position lookup into the packed CSR arena.
+      this->packed_ip_ok = refSketch.packed_ok;
       // Build reference name -> seqId once (for the integer skip_self test).
       this->refNameToId.reserve(refSketch.metadata.size());
       for (seqno_t i = 0; i < (seqno_t)refSketch.metadata.size(); ++i) {
         this->refNameToId[refSketch.metadata[i].name] = i;
+      }
+      // Memoize estimateMinimumHitsRelaxed over all possible sketch sizes.
+      this->minHitsCache.resize(param.sketchSize + 1);
+      for (int s = 0; s <= param.sketchSize; ++s) {
+        this->minHitsCache[s] = Stat::estimateMinimumHitsRelaxed(s, param.kmerSize, param.percentageIdentity, skch::fixed::confidence_interval);
+      }
+      // Partition offsets of the (seqId, wpos)-sorted minmerIndex by seqId;
+      // empty seqIds point at the next sequence's start.
+      {
+        const auto& mi = refSketch.minmerIndex;
+        minmerIndexSeqStart.assign(refSketch.metadata.size() + 1, mi.size());
+        for (size_t i = mi.size(); i-- > 0; ) {
+          minmerIndexSeqStart[mi[i].seqId] = i;
+        }
+        for (size_t s = refSketch.metadata.size(); s-- > 0; ) {
+          if (minmerIndexSeqStart[s] > minmerIndexSeqStart[s + 1])
+            minmerIndexSeqStart[s] = minmerIndexSeqStart[s + 1];
+        }
       }
       this->mapQuery();
     }
@@ -579,7 +568,7 @@ namespace skch
 				param.query_prefix,
 				allowed_query_names,
                 [&](const std::string& seq_name,
-                    const std::string& seq) {
+                    std::string&& seq) {
                     // todo: offset_t is an 32-bit integer, which could cause problems
                     offset_t len = seq.length();
 					if (param.skip_self
@@ -608,7 +597,7 @@ namespace skch
 						{
 							totalReadsPickedForMapping++;
 							//Dispatch input to thread
-							threadPool.runWhenThreadAvailable(new InputSeqProgContainer(seq, seq_name, seqCounter, progress));
+							threadPool.runWhenThreadAvailable(new InputSeqProgContainer(std::move(seq), seq_name, seqCounter, progress));
 
 							//Collect output if available
 							while ( threadPool.outputAvailable() ) {
@@ -638,13 +627,22 @@ namespace skch
           MappingResultsVector_t tmpMappings;
           MappingResultsVector_t filteredMappings;
 
+          // Precompute each query's group once (getRefGroup is O(#ref contigs))
+          std::vector<int> queryGroup;
+          if (param.skip_prefix)
+          {
+            queryGroup.resize(qmetadata.size());
+            for (size_t i = 0; i < qmetadata.size(); i++)
+              queryGroup[i] = this->getRefGroup(qmetadata[i].name);
+          }
+
           while (subrange_end != allReadMappings.end())
           {
             if (param.skip_prefix)
             {
-              int currGroup = this->getRefGroup(qmetadata[subrange_begin->querySeqId].name);
-              subrange_end = std::find_if_not(subrange_begin, allReadMappings.end(), [this, currGroup] (const auto& allReadMappings_candidate) {
-                  return currGroup == this->getRefGroup(this->qmetadata[allReadMappings_candidate.querySeqId].name);
+              int currGroup = queryGroup[subrange_begin->querySeqId];
+              subrange_end = std::find_if_not(subrange_begin, allReadMappings.end(), [&queryGroup, currGroup] (const auto& allReadMappings_candidate) {
+                  return currGroup == queryGroup[allReadMappings_candidate.querySeqId];
               });
             }
             else
@@ -850,13 +848,10 @@ namespace skch
         output->qseqLen = input->len;
         bool split_mapping = true;
         std::vector<IntervalPoint> intervalPoints;
-        // Reserve the "expected" number of interval points
-        intervalPoints.reserve(
-            2 * param.sketchSize * refSketch.minmerIndex.size() / refSketch.minmerPosLookupIndex.size());
         std::vector<L1_candidateLocus_t> l1Mappings;
         MappingResultsVector_t l2Mappings;
         MappingResultsVector_t unfilteredMappings;
-        int refGroup = this->getRefGroup(input->seqName);
+        int refGroup = param.skip_prefix ? this->getRefGroup(input->seqName) : -1;
 
         if(! param.split || input->len <= param.segLength)
         {
@@ -1140,24 +1135,59 @@ namespace skch
           if(Q.minmerTableQuery.size() == 0)
             return;
 
+          // Reserve the "expected" number of interval points
+          // (lazy: the packed path never reaches this function)
+          if (intervalPoints.capacity() == 0)
+            intervalPoints.reserve(
+                2 * param.sketchSize * refSketch.minmerIndex.size() / refSketch.nUniqueMinmers);
+
           // Gather matched interval points directly during the reference lookup
           // (no separate priority-queue pass; radixSortIntervalPoints sorts afterwards).
           const size_t ip_start = intervalPoints.size();
           const seqno_t queryRefId = param.skip_self ? this->queryRefSeqId(Q.seqName) : (seqno_t)-1;
+          const bool doSelf = param.skip_self;
+          const bool doPref = param.skip_prefix;
+          const bool doLT = param.lower_triangular;
+          const bool anyPairs = !allowed_pairs.empty();
+          const auto* refGroupData = this->refIdGroup.data();
+          const std::string pairPrefix = anyPairs ? Q.seqName + "\t" : std::string();
           for(auto it = Q.minmerTableQuery.begin(); it != Q.minmerTableQuery.end(); it++)
           {
             //Check if hash value exists in the reference lookup index
+            if (refSketch.packed_ok) {
+              // CSR arena: decode each packed key back to the identical
+              // IntervalPoint (hash is the lookup key itself).
+              const auto seedFind = refSketch.posLookupCSR.find(it->hash);
+              if(seedFind == refSketch.posLookupCSR.end())
+                continue;
+              const uint64_t* runB = refSketch.ipArena.data() + seedFind->second.off;
+              const uint64_t* runE = runB + seedFind->second.cnt;
+              for (const uint64_t* k = runB; k != runE; ++k)
+              {
+                IntervalPoint ip = decodePackedIP(*k);
+                ip.hash = it->hash;
+                if ((!doSelf || queryRefId != ip.seqId)
+                    && (!doPref || refGroupData[ip.seqId] != Q.refGroup)
+                    && (!doLT || Q.seqCounter > ip.seqId)
+                    && (!anyPairs
+                        || allowed_pairs.count(pairPrefix + this->refSketch.metadata[ip.seqId].name))
+                ) {
+                  intervalPoints.push_back(ip);
+                }
+              }
+              continue;
+            }
             const auto seedFind = refSketch.minmerPosLookupIndex.find(it->hash);
             if(seedFind == refSketch.minmerPosLookupIndex.end())
               continue;
 
             for (const auto& ip : seedFind->second)
             {
-              if ((!param.skip_self || queryRefId != ip.seqId)
-                  && (!param.skip_prefix || this->refIdGroup[ip.seqId] != Q.refGroup)
-                  && (!param.lower_triangular || Q.seqCounter > ip.seqId)
-                  && (allowed_pairs.empty()
-                      || allowed_pairs.count(Q.seqName + "\t" + this->refSketch.metadata[ip.seqId].name))
+              if ((!doSelf || queryRefId != ip.seqId)
+                  && (!doPref || refGroupData[ip.seqId] != Q.refGroup)
+                  && (!doLT || Q.seqCounter > ip.seqId)
+                  && (!anyPairs
+                      || allowed_pairs.count(pairPrefix + this->refSketch.metadata[ip.seqId].name))
               ) {
                 intervalPoints.push_back(ip);
               }
@@ -1184,27 +1214,76 @@ namespace skch
 
           const std::size_t start = packed.size();
           const seqno_t queryRefId = param.skip_self ? this->queryRefSeqId(Q.seqName) : (seqno_t)-1;
+          const bool doSelf = param.skip_self;
+          const bool doPref = param.skip_prefix;
+          const bool doLT = param.lower_triangular;
+          const bool anyPairs = !allowed_pairs.empty();
+          const auto* refGroupData = this->refIdGroup.data();
+          const std::string pairPrefix = anyPairs ? Q.seqName + "\t" : std::string();
+          // When no per-point predicate can reject anything, whole runs are
+          // appended with one insert (the arena is already encodePackedIP keys).
+          const bool noFilter = (!doSelf || queryRefId == (seqno_t)-1) && !doPref && !doLT && !anyPairs;
+          const uint64_t* arena = refSketch.ipArena.data();
           for(auto it = Q.minmerTableQuery.begin(); it != Q.minmerTableQuery.end(); it++)
           {
-            const auto seedFind = refSketch.minmerPosLookupIndex.find(it->hash);
-            if(seedFind == refSketch.minmerPosLookupIndex.end())
+            const auto seedFind = refSketch.posLookupCSR.find(it->hash);
+            if(seedFind == refSketch.posLookupCSR.end())
               continue;
 
-            for (const auto& ip : seedFind->second)
+            const uint64_t* runB = arena + seedFind->second.off;
+            const uint64_t* runE = runB + seedFind->second.cnt;
+            if (noFilter) {
+              packed.insert(packed.end(), runB, runE);
+              continue;
+            }
+            for (const uint64_t* k = runB; k != runE; ++k)
             {
-              if ((!param.skip_self || queryRefId != ip.seqId)
-                  && (!param.skip_prefix || this->refIdGroup[ip.seqId] != Q.refGroup)
-                  && (!param.lower_triangular || Q.seqCounter > ip.seqId)
-                  && (allowed_pairs.empty()
-                      || allowed_pairs.count(Q.seqName + "\t" + this->refSketch.metadata[ip.seqId].name))
+              const seqno_t sid = (seqno_t)(*k >> 33);
+              if ((!doSelf || queryRefId != sid)
+                  && (!doPref || refGroupData[sid] != Q.refGroup)
+                  && (!doLT || Q.seqCounter > sid)
+                  && (!anyPairs
+                      || allowed_pairs.count(pairPrefix + this->refSketch.metadata[sid].name))
               ) {
-                packed.push_back(encodePackedIP(ip));
+                packed.push_back(*k);
               }
             }
           }
           radixSortPackedKeys(packed, start);
         }
 
+
+      // One recorded pos-group of the fused L1 counting sweep: the group's
+      // coordinate (seqId of its first point, pos) and the overlap count right
+      // after consuming the group.
+      struct SweepStep {
+        seqno_t seqId;
+        offset_t pos;
+        int overlapAfter;
+      };
+
+      // End of the run of interval points with seqId == sid starting at runStart.
+      template <typename IP_iter>
+      static IP_iter findIPRunEnd(IP_iter runStart, IP_iter ip_end, seqno_t sid)
+      {
+        if constexpr (std::is_same_v<IP_iter, PackedIPCursor>) {
+          const uint64_t bound = (uint64_t)(uint32_t)(sid + 1) << 33;
+          return PackedIPCursor{ std::lower_bound(runStart.p, ip_end.p, bound) };
+        } else {
+          return std::partition_point(runStart, ip_end,
+              [sid](const auto& p) { return p.seqId <= sid; });
+        }
+      }
+
+      template <typename IP_iter>
+      static bool ipBefore(const IP_iter& a, const IP_iter& b)
+      {
+        if constexpr (std::is_same_v<IP_iter, PackedIPCursor>) {
+          return a.p < b.p;
+        } else {
+          return a < b;
+        }
+      }
 
       template <typename Q_Info, typename IP_iter, typename Vec2>
         void computeL1CandidateRegions(
@@ -1218,10 +1297,13 @@ namespace skch
           std::cerr << "INFO, skch::Map:computeL1CandidateRegions, read id " << Q.seqCounter << std::endl;
 #endif
 
+          if (ip_begin == ip_end)
+            return;
+
           int overlapCount = 0;
-          int strandCount = 0;
           int bestIntersectionSize = 0;
-          std::vector<L1_candidateLocus_t> localOpts;
+          thread_local std::vector<L1_candidateLocus_t> localOpts;
+          localOpts.clear();
 
           // Keep track of all minmer windows that intersect with [i, i+windowLen]
           int windowLen = std::max<offset_t>(0, Q.len - param.segLength);
@@ -1239,41 +1321,143 @@ namespace skch
           // Only necessary when windowLen != 0.
           std::unordered_map<hash_t, int> hash_to_freq;
 
+          bool in_candidate = false;
+          L1_candidateLocus_t l1_out = {};
+
+          // Candidate-emission state machine, applied once per pos-group with the
+          // overlap count and coordinate of the PREVIOUS group. Shared verbatim by
+          // the fused replay (stage1_topANI_filter) and the plain sweep below.
+          auto emit = [&](int prevOverlap, const SeqCoord& prevPos) {
+          if ( prevOverlap >= minimumHits
+              //&& prevOverlap > overlapCount && prevOverlap >= prevPrevOverlap)
+          ) {
+            if (l1_out.seqId != prevPos.seqId && in_candidate) {
+              localOpts.push_back(l1_out);
+              l1_out = {};
+              in_candidate = false;
+            }
+            if (!in_candidate) {
+              l1_out.rangeStartPos = prevPos.pos - windowLen;
+              l1_out.rangeEndPos = prevPos.pos - windowLen;
+              l1_out.seqId = prevPos.seqId;
+              l1_out.intersectionSize = prevOverlap;
+              in_candidate = true;
+            } else {
+              if (param.stage2_full_scan) {
+                l1_out.intersectionSize = std::max(l1_out.intersectionSize, prevOverlap);
+                l1_out.rangeEndPos = prevPos.pos - windowLen;
+              }
+              else if (l1_out.intersectionSize < prevOverlap) {
+                l1_out.intersectionSize = prevOverlap;
+                l1_out.rangeStartPos = prevPos.pos - windowLen;
+                l1_out.rangeEndPos = prevPos.pos - windowLen;
+              }
+            }
+          }
+          else {
+            if (in_candidate) {
+              localOpts.push_back(l1_out);
+              l1_out = {};
+            }
+            in_candidate = false;
+          }
+          };
+
           if (param.stage1_topANI_filter) {
-            while (leadingIt != ip_end)
+            // Fused counting sweep: one traversal records each pos-group's
+            // coordinate and post-group overlap; the emission machine is replayed
+            // from that compact record after minimumHits is raised. seqId runs
+            // that cannot reach minimumHits collapse to a single zero-overlap
+            // step: their opens/closes balance to zero, they can never emit, and
+            // they cannot own bestIntersectionSize in a way that changes the
+            // early return or the raise (their best < minimumHits <= any
+            // qualifying run's best).
+            thread_local std::vector<SweepStep> steps;
+            steps.clear();
+            auto runStart = ip_begin;
+            bool cleanStart = true;   // leading did not overshoot into this run
+            while (runStart != ip_end)
             {
-              // Catch the trailing iterator up to the leading iterator - windowLen
-              while (
-                  trailingIt != ip_end 
-                  && ((trailingIt->seqId == leadingIt->seqId && trailingIt->pos <= leadingIt->pos - windowLen)
-                    || trailingIt->seqId < leadingIt->seqId))
+              const seqno_t runSeqId = runStart->seqId;
+              const auto runEnd = findIPRunEnd(runStart, ip_end, runSeqId);
+              if (windowLen == 0 && cleanStart)
               {
-                if (trailingIt->side == side::CLOSE) {
-                  if (windowLen != 0)
+                std::size_t runLen;
+                offset_t lastPos;
+                if constexpr (std::is_same_v<IP_iter, PackedIPCursor>) {
+                  runLen = (std::size_t)(runEnd.p - runStart.p);
+                  lastPos = (offset_t)((*(runEnd.p - 1) >> 1) & 0xFFFFFFFFULL);
+                } else {
+                  runLen = (std::size_t)std::distance(runStart, runEnd);
+                  lastPos = std::prev(runEnd)->pos;
+                }
+                // Prune only when the run also does not share a position with the
+                // next run (pos-only grouping would merge such points into one
+                // group whose overlap must include both runs' opens).
+                if ((int)(runLen / 2) < minimumHits
+                    && !(runEnd != ip_end && runEnd->pos == lastPos))
+                {
+                  steps.push_back(SweepStep{runSeqId, runStart->pos, 0});
+                  trailingIt = runEnd;
+                  leadingIt = runEnd;
+                  runStart = runEnd;
+                  continue;
+                }
+              }
+              if (windowLen == 0)
+              {
+                // windowLen == 0: a CLOSE at position C is drained by the
+                // trailing iterator exactly when the leading group reaches C
+                // (pos <= P inclusive), so the overlap after each pos-group is a
+                // plain running sum of +1/-1 over the sorted points and the
+                // trailing iterator is unnecessary.
+                while (ipBefore(leadingIt, runEnd))
+                {
+                  const seqno_t groupSeqId = leadingIt->seqId;
+                  const offset_t groupPos = leadingIt->pos;
+                  while (leadingIt != ip_end && leadingIt->pos == groupPos) {
+                    overlapCount += (leadingIt->side == side::OPEN) ? 1 : -1;
+                    leadingIt++;
+                  }
+                  bestIntersectionSize = std::max(bestIntersectionSize, overlapCount);
+                  steps.push_back(SweepStep{groupSeqId, groupPos, overlapCount});
+                }
+                trailingIt = leadingIt;   // preserve the run-boundary invariant
+              }
+              else
+              while (ipBefore(leadingIt, runEnd))
+              {
+                // Catch the trailing iterator up to the leading iterator - windowLen
+                while (
+                    trailingIt != ip_end
+                    && ((trailingIt->seqId == leadingIt->seqId && trailingIt->pos <= leadingIt->pos - windowLen)
+                      || trailingIt->seqId < leadingIt->seqId))
+                {
+                  if (trailingIt->side == side::CLOSE) {
                     hash_to_freq[trailingIt->hash]--;
-                  if (windowLen == 0 || hash_to_freq[trailingIt->hash] == 0) {
-                    overlapCount--;
+                    if (hash_to_freq[trailingIt->hash] == 0) {
+                      overlapCount--;
+                    }
                   }
+                  trailingIt++;
                 }
-                trailingIt++;
-              }
-              auto currentPos = leadingIt->pos;
-              while (leadingIt != ip_end && leadingIt->pos == currentPos) {
-                if (leadingIt->side == side::OPEN) {
-                  if (windowLen == 0 || hash_to_freq[leadingIt->hash] == 0) {
-                    overlapCount++;
-                  }
-                  if (windowLen != 0)
+                const seqno_t groupSeqId = leadingIt->seqId;
+                const offset_t groupPos = leadingIt->pos;
+                while (leadingIt != ip_end && leadingIt->pos == groupPos) {
+                  if (leadingIt->side == side::OPEN) {
+                    if (hash_to_freq[leadingIt->hash] == 0) {
+                      overlapCount++;
+                    }
                     hash_to_freq[leadingIt->hash]++;
+                  }
+                  leadingIt++;
                 }
-                leadingIt++;
+                //Is this sliding window the best we have so far?
+                bestIntersectionSize = std::max(bestIntersectionSize, overlapCount);
+                steps.push_back(SweepStep{groupSeqId, groupPos, overlapCount});
               }
-
-              //DEBUG_ASSERT(overlapCount >= 0, windowLen, trailingIt->seqId, trailingIt->pos, leadingIt->seqId, leadingIt->pos);
-              //DEBUG_ASSERT(windowLen != 0 || overlapCount <= Q.sketchSize, windowLen, trailingIt->seqId, trailingIt->pos, leadingIt->seqId, leadingIt->pos);
-
-              //Is this sliding window the best we have so far?
-              bestIntersectionSize = std::max(bestIntersectionSize, overlapCount);
+              cleanStart = (leadingIt == runEnd);
+              runStart = leadingIt;
             }
 
             // Only go back through to find local opts if we know that there are some that are 
@@ -1285,23 +1469,48 @@ namespace skch
             {
               minimumHits = std::max(
                   sketchCutoffs[
-                    int(std::min(bestIntersectionSize, Q.sketchSize) 
+                    int(std::min(bestIntersectionSize, Q.sketchSize)
                       / std::max<double>(1, param.sketchSize / skch::fixed::ss_table_max))
                   ],
                   minimumHits);
             }
-          } 
+
+            // Replay the emission machine over the recorded pos-groups: step t's
+            // emission sees the overlap/coordinate of step t-1 (the last step's
+            // overlap is never read, exactly like the plain sweep's last group).
+            int prevOverlap = 0;
+            SeqCoord prevPos{};
+            for (const auto& st : steps) {
+              emit(prevOverlap, prevPos);
+              prevOverlap = st.overlapAfter;
+              prevPos = SeqCoord{st.seqId, st.pos};
+            }
+          }
           
+#ifdef WFMASH_SWEEP_VERIFY
+          // Verification mode: finalize and stash the fused result, then let the
+          // reference sweep below recompute into localOpts for comparison.
+          std::vector<L1_candidateLocus_t> fusedOpts;
+          if (param.stage1_topANI_filter) {
+            if (in_candidate) localOpts.push_back(l1_out);
+            in_candidate = false;
+            l1_out = {};
+            fusedOpts = localOpts;
+            localOpts.clear();
+          }
+          if (true)
+#else
+          if (!param.stage1_topANI_filter)
+#endif
+          {
           // Clear freq dict, as there will be left open CLOSE points at the end of the last seq
           // that we never got to
           hash_to_freq.clear();
 
           // Since there can be more than sketchSize windows that overlap w/ [i, i+windowLen]
-          // cap the best intersection size 
+          // cap the best intersection size
           bestIntersectionSize = std::min(bestIntersectionSize, Q.sketchSize);
 
-          bool in_candidate = false;
-          L1_candidateLocus_t l1_out = {};
           trailingIt = ip_begin;
           leadingIt = ip_begin;
 
@@ -1353,43 +1562,28 @@ namespace skch
               }
               leadingIt++;
             }
-          if ( prevOverlap >= minimumHits
-              //&& prevOverlap > overlapCount && prevOverlap >= prevPrevOverlap)
-          ) {
-            if (l1_out.seqId != prevPos.seqId && in_candidate) {
-              localOpts.push_back(l1_out);
-              l1_out = {};
-              in_candidate = false;
-            }
-            if (!in_candidate) {
-              l1_out.rangeStartPos = prevPos.pos - windowLen;
-              l1_out.rangeEndPos = prevPos.pos - windowLen;
-              l1_out.seqId = prevPos.seqId;
-              l1_out.intersectionSize = prevOverlap;
-              in_candidate = true;
-            } else {
-              if (param.stage2_full_scan) {
-                l1_out.intersectionSize = std::max(l1_out.intersectionSize, prevOverlap);
-                l1_out.rangeEndPos = prevPos.pos - windowLen;
-              }
-              else if (l1_out.intersectionSize < prevOverlap) {
-                l1_out.intersectionSize = prevOverlap;
-                l1_out.rangeStartPos = prevPos.pos - windowLen;
-                l1_out.rangeEndPos = prevPos.pos - windowLen;
-              }
-            }
-          } 
-          else {
-            if (in_candidate) {
-              localOpts.push_back(l1_out);
-              l1_out = {};
-            }
-            in_candidate = false;
-          }
+          emit(prevOverlap, prevPos);
         }
+          }
         if (in_candidate) {
           localOpts.push_back(l1_out);
         }
+#ifdef WFMASH_SWEEP_VERIFY
+        if (param.stage1_topANI_filter) {
+          bool same = fusedOpts.size() == localOpts.size();
+          for (std::size_t i = 0; same && i < fusedOpts.size(); ++i) {
+            same = fusedOpts[i].seqId == localOpts[i].seqId
+                && fusedOpts[i].rangeStartPos == localOpts[i].rangeStartPos
+                && fusedOpts[i].rangeEndPos == localOpts[i].rangeEndPos
+                && fusedOpts[i].intersectionSize == localOpts[i].intersectionSize;
+          }
+          if (!same) {
+            std::cerr << "[wfmash] WFMASH_SWEEP_VERIFY mismatch, query " << Q.seqCounter
+                      << " fused=" << fusedOpts.size() << " ref=" << localOpts.size() << std::endl;
+            std::abort();
+          }
+        }
+#endif
         
 
         // Join together proximal local opts
@@ -1432,7 +1626,9 @@ namespace skch
           }
 
           //3. Compute L1 windows
-          int minimumHits = Stat::estimateMinimumHitsRelaxed(Q.sketchSize, param.kmerSize, param.percentageIdentity, skch::fixed::confidence_interval);
+          int minimumHits = (size_t)Q.sketchSize < minHitsCache.size()
+              ? minHitsCache[Q.sketchSize]
+              : Stat::estimateMinimumHitsRelaxed(Q.sketchSize, param.kmerSize, param.percentageIdentity, skch::fixed::confidence_interval);
 
           // Fast packed-key path: windowLen == max(0, Q.len - segLength) is 0 here
           // (Q.len <= segLength, the default split fragmentation), so IntervalPoint::hash
@@ -1509,7 +1705,7 @@ namespace skch
         void doL2Mapping(Q_Info &Q, L1_Iter l1_begin, L1_Iter l1_end, VecOut &l2Mappings)
         {
           ///2. Walk the read over the candidate regions and compute the jaccard similarity with minimum s sketches
-          std::vector<L2_mapLocus_t> l2_vec;
+          thread_local std::vector<L2_mapLocus_t> l2_vec;
           double bestJaccardNumerator = 0;
           auto loc_iterator = l1_begin;
           while (loc_iterator != l1_end)
@@ -1613,14 +1809,19 @@ namespace skch
           //candidateLocus.rangeStartPos -= param.segLength;
           //candidateLocus.rangeEndPos += param.segLength;
           
-          // Get first potential mashimizer
-          const MinmerInfo first_minmer = MinmerInfo {0, candidateLocus.rangeStartPos - param.segLength - 1, 0, candidateLocus.seqId, 0};
-
-          //const MinmerInfo first_minmer = MinmerInfo {0, candidateLocus.seqId, -1, 0, 0};
-          auto firstOpenIt = std::lower_bound(minmerIndex.begin(), minmerIndex.end(), first_minmer); 
+          // Get first potential mashimizer: search only within this seqId's slice
+          // of the (seqId, wpos)-sorted index (equivalent to the former whole-index
+          // lower_bound on {seqId, wpos}).
+          const offset_t windowStartPos = candidateLocus.rangeStartPos - param.segLength - 1;
+          auto firstOpenIt = std::lower_bound(
+              minmerIndex.begin() + minmerIndexSeqStart[candidateLocus.seqId],
+              minmerIndex.begin() + minmerIndexSeqStart[candidateLocus.seqId + 1],
+              windowStartPos,
+              [](const MinmerInfo& mi, offset_t w) { return mi.wpos < w; });
 
           // Keeps track of the lowest end position
-          std::vector<skch::MinmerInfo> slidingWindow;
+          thread_local std::vector<skch::MinmerInfo> slidingWindow;
+          slidingWindow.clear();
           slidingWindow.reserve(Q.sketchSize);
 
           // Used to make a min-heap
@@ -1920,8 +2121,9 @@ namespace skch
           auto disjoint_sets = dsets::DisjointSets(ufv.data(), ufv.size());
 
           //Start the procedure to identify the chains
+          std::vector<std::pair<double, uint64_t>> distances;
           for (auto it = readMappings.begin(); it != readMappings.end(); it++) {
-              std::vector<std::pair<double, uint64_t>> distances;
+              distances.clear();
               for (auto it2 = std::next(it); it2 != readMappings.end(); it2++) {
                   //If this mapping is for the same segment, ignore
                   if (it2->refSeqId == it->refSeqId && it2->queryStartPos == it->queryStartPos) {
@@ -1954,8 +2156,8 @@ namespace skch
                   }
               }
               if (distances.size()) {
-                  std::sort(distances.begin(), distances.end());
-                  disjoint_sets.unite(it->splitMappingId, distances.front().second);
+                  disjoint_sets.unite(it->splitMappingId,
+                      std::min_element(distances.begin(), distances.end())->second);
               }
           }
 
