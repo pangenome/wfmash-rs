@@ -29,6 +29,7 @@ fn main() {
     if wfmash_bin.exists() {
         println!("cargo:warning=wfmash binary already built, skipping rebuild");
         println!("cargo:rustc-env=WFMASH_BIN_DIR={}", out_dir.display());
+        println!("cargo:bindir={}", out_dir.display());
         return;
     }
 
@@ -137,6 +138,7 @@ fn main() {
 
     println!("cargo:warning=wfmash binary built successfully");
     println!("cargo:rustc-env=WFMASH_BIN_DIR={}", out_dir.display());
+    println!("cargo:bindir={}", out_dir.display());
 }
 
 /// Find Homebrew GCC on macOS (needed for OpenMP support).
