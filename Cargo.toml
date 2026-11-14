@@ -2,6 +2,8 @@
 name = "wfmash-rs"
 version = "0.1.0"
 edition = "2021"
+# Dependents read DEP_WFMASH_BINDIR in build.rs
+links = "wfmash"
 authors = ["Erik Garrison <erik.garrison@gmail.com>", "Andrea Guarracino <aguarra1@uthsc.edu>"]
 license = "MIT"
 description = "Rust bindings for wfmash whole-genome aligner"
